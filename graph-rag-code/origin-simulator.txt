@@ -1,0 +1,3186 @@
+# mix.exs
+
+```elixir
+defmodule OriginSimulator.MixProject do
+  use Mix.Project
+
+  @description """
+  A tool to simulate a (flaky) upstream origin during load and stress tests.
+  """
+
+  def project do
+    [
+      app: :origin_simulator,
+      version: "1.1.0",
+      elixir: "~> 1.14",
+      start_permanent: Mix.env() == :prod,
+      deps: deps(),
+      package: package(),
+
+      # Docs
+      name: "OriginSimulator",
+      description: @description,
+      source_url: "https://github.com/bbc/origin_simulator",
+      homepage_url: "https://github.com/bbc/origin_simulator",
+      docs: [
+        main: "README",
+        extras: ["README.md"]
+      ]
+    ]
+  end
+
+  def application do
+    [
+      extra_applications: [:logger],
+      mod: {OriginSimulator.Application, []}
+    ]
+  end
+
+  defp deps do
+    [
+      {:plug, "~> 1.13"},
+      {:cowboy, "~> 2.9"},
+      {:plug_cowboy, "~> 2.6"},
+      {:poison, "~> 5.0"},
+      {:httpoison, "~> 2.0"},
+      {:distillery, "~> 2.1"},
+      {:ex_doc, "~> 0.29", only: :dev, runtime: false}
+    ]
+  end
+
+  defp package do
+    [
+      name: "origin_simulator",
+      maintainers: [
+        "bbc",
+        "JoeARO",
+        "ettomatic",
+        "samfrench"
+      ],
+      licenses: ["MIT"],
+      links: %{"GitHub" => "https://github.com/bbc/origin_simulator"}
+    ]
+  end
+end
+
+```
+
+# README.md
+
+```markdown
+# OriginSimulator [![Build Status](https://travis-ci.org/bbc/origin_simulator.svg?branch=master)](https://travis-ci.org/bbc/origin_simulator)
+
+A tool to simulate a (flaky) upstream origin during load and stress tests.
+
+In our constant quest to improve our services to be more fault tolerant and handle faulty conditions without nasty surprises, we are trying to make load and stress test more automated and reproducible.
+
+This tool is designed to be a simple helper to simulate an upstream service behaving unexpectedly for a programmable prolonged period of time. We can then use a load test to see how our downstream service react.
+
+OriginSimulator can also be used to simulate continuous responses with a given latency from a fake service.
+
+These are the moving parts of a simple load test:
+
+```
+┌────────────────────┐        ┌────────────────────┐        ┌────────────────────┐
+│                    ├────────▶                    ├────────▶                    │
+│  Load Test Client  │        │       Target       │        │  OriginSimulator   │
+│                    ◀────────┤                    ◀────────┤                    │
+└────────────────────┘        └────────────────────┘        └────────────────────┘
+```
+
+Where:
+* A **Load Test Client**, could be a tool like [WRK2](https://github.com/giltene/wrk2), [AB](https://httpd.apache.org/docs/2.4/programs/ab.html) or [Vegeta](https://github.com/tsenart/vegeta).
+* The load test **Target** is the service you want to test, such as NGINX, custom app or whatever fetches data from an upstream source.
+* **OriginSimulator** can simulate an origin and can be programatically set to behave slow or unstable.
+
+## Scenarios
+
+A JSON recipe defines the different stages of the scenario. This is an example of specifying an origin with stages:
+
+```json
+{
+    "origin": "https://www.bbc.co.uk/news",
+    "stages": [
+        {
+            "at": 0,
+            "latency": "50ms",
+            "status": 404
+        },
+        {
+            "at": "4s",
+            "latency": "2s",
+            "status": 503
+        },
+        {
+            "at": "6s",
+            "latency": "100ms",
+            "status": 200
+        }
+    ]
+}
+```
+
+Where `at` represents the time points (in milliseconds) for a state mutation, and latency the simulated response time in milliseconds. In this case:
+
+```
+  0s                     4s                   6s                  ∞
+  *──────────────────────*────────────────────*───────────────────▶
+
+       HTTP 404 50ms           HTTP 503 2s       HTTP 200 100ms
+```
+
+The recipe can also be a list of simulation scenarios, as descirbed in [multi-route origin simulation](#multi-route-origin-simulation) below.
+
+```json
+[
+	{
+		"origin": "...",
+		"stages": "...",
+		..
+	},
+	{
+		"origin": "...",
+		"stages": "...",
+		..
+	},
+	{
+		"origin": "..",
+		"stages": "...",
+		..
+	}
+]
+```
+
+## Latency
+
+Any stage defines the simulated latency in ms. Is possible to simulate random latency using an array of values. 
+In the example below any response will take a random amount of time within the range 1000..1500:
+
+```json
+{
+    "random_content": "428kb",
+    "stages": [
+        {
+            "at": 0,
+            "latency": "1000ms..1500ms",
+            "status": 200
+        }
+    ]
+}
+```
+
+
+## Sources
+
+OriginSimulator can be used in three ways.
+
+* Serving cached content from an origin.
+
+```json
+{
+    "origin": "https://www.bbc.co.uk/news",
+    "stages": [
+        {
+            "at": 0,
+            "latency": "100ms",
+            "status": 200
+        }
+    ]
+}
+```
+
+* Serving random sized content.
+
+In this example we are requiring a continuous successful response with no simulated latency, returning a 428kb payload
+
+```json
+{
+    "random_content": "428kb",
+    "stages": [
+        {
+            "at": 0,
+            "latency": "100ms",
+            "status": 200
+        }
+    ]
+}
+```
+
+* Serving content posted to it.
+
+In this example content is posted along with the recipe. Where the payload body section can be any content such as HTML or JSON.
+
+```json
+{
+    "body": "{\"hello\":\"world\"}",
+    "stages": [
+        {
+            "at": 0,
+            "latency": "100ms",
+            "status": 200
+        }
+    ]
+}
+```
+
+It's also possible to define random content inside the posted body. This can be useful to
+simulate JSON contracts, structured text, etc.
+
+```json
+{
+    "body": "{\"data\":\"<<256kb>>\", \"metadata\":\"<<128b>>and<<16b>>\", \"collection\":[\"<<128kb>>\", \"<<256kb>>\"]}\"}",
+    "stages": [
+        {
+            "at": 0,
+            "latency": "100ms",
+            "status": 200
+        }
+    ]
+}
+```
+
+## Multi-route origin simulation
+
+OriginSimulator can also provide multiple origins simulation. Each origin is specified with a recipe and accessible through a `route` (request path) on the simulator. This is an example of specifying multiple origins with different routes:
+
+```json
+[
+  {
+    "route": "/",
+    "origin": "https://www.bbc.co.uk/",
+    "stages": [
+      {
+        "at": 0,
+        "status": 200,
+        "latency": "100ms"
+      }
+    ]
+  },
+  {
+    "route": "/news*",
+    "origin": "https://www.bbc.co.uk/news",
+    "stages": [
+      {
+        "at": 0,
+        "status": 200,
+        "latency": 0
+      }
+    ]
+  },
+  {
+    "route": "/sport",
+    "origin": "https://www.bbc.co.uk/sport",
+    "stages": [
+      {
+        "at": 0,
+        "status": 200,
+        "latency": "1s"
+      },
+      {
+        "at": "5s",
+        "status": 200,
+        "latency": "100ms"
+      }
+    ]
+  }
+]
+```
+
+Where `route` is the request path on the simulator from which the corresponding origin can be accessed. A wildcard route may be used to match paths of the same domain, e.g. `/news*` (above) for `/news/business-51443421`. 
+
+The wildcard root route (`/*`) is the default If no route is specified for a scenario.
+
+Multiple origins of mixed sources can also be specified:
+
+```
+[
+  {
+    "route": "/data/api",
+    "body": "{\"data\":\"<<256kb>>\", \"metadata\":\"<<128b>>and<<16b>>\", \"collection\":[\"<<128kb>>\", \"<<256kb>>\"]}\"}",
+    "stages": [
+        {
+            "at": 0,
+            "latency": "100ms",
+            "status": 200
+        }
+    ]
+  },
+  {
+    "route": "/news",
+    "origin": "https://www.bbc.co.uk/news",
+    "stages": [
+      {
+        "at": 0,
+        "status": 404,
+        "latency": "50ms"
+      },
+      {
+        "at": "2s",
+        "status": 503,
+        "latency": "2s"
+      },
+      {
+        "at": "4s",
+        "status": 200,
+        "latency": "100ms"
+      }
+    ]
+  }
+]
+```
+## Usage
+
+You can post recipes using `curl` and the `mix upload_recipe` task.
+
+First run the Elixir app:
+```
+$ env MIX_ENV=prod iex -S mix
+Erlang/OTP 21 [erts-10.1.2] [source] [64-bit] [smp:4:4] [ds:4:4:10] [async-threads:1] [hipe] [dtrace]
+
+Interactive Elixir (1.7.4) - press Ctrl+C to exit (type h() ENTER for help)
+iex(1)>
+```
+
+The app is now ready, but still waiting for a recipe:
+```shell
+$ curl http://127.0.0.1:8080/_admin/current_recipe
+"Recipe not set, please POST a recipe to /_admin/add_recipe"⏎
+
+$ curl -i http://127.0.0.1:8080/
+HTTP/1.1 406 Not Acceptable
+cache-control: max-age=0, private, must-revalidate
+content-length: 2
+content-type: text/plain; charset=utf-8
+date: Sat, 12 Jan 2019 23:18:10 GMT
+server: Cowboy
+```
+
+Let's add a simple recipe:
+```shell
+$ cat examples/demo.json
+{
+    "origin": "https://www.bbc.co.uk",
+    "stages": [
+        { "at": 0,    "status": 200, "latency": "200ms"},
+        { "at": "10s", "status": 500, "latency": "500ms"},
+        { "at": "30s", "status": 200, "latency": "200ms"}
+    ]
+}
+
+$ cat examples/demo.json | curl -X POST -d @- http://127.0.0.1:8080/_admin/add_recipe
+```
+
+All done! Now at different times the server will respond with the indicated HTTP status code and response time:
+```
+$ curl -i http://127.0.0.1:8080/
+HTTP/1.1 404 Not Found
+...
+
+$ curl -i http://127.0.0.1:8080/
+HTTP/1.1 503 Service Unavailable
+...
+
+$ curl -i http://127.0.0.1:8080/
+HTTP/1.1 200 OK
+...
+```
+
+At any time you can reset the scenario by simply POSTing a new one to `/_admin/add_recipe`. 
+
+In multiple origins scenario, new origins and routes can be added to the existing ones through `/_admin/add_recipe`. Existing scenarios can also be updated. For example you can "take down" an origin by updating its recipe with 500 status.
+
+### Using Belfrage with Origin Simulator locally
+1. Change dev [config value in belfrage](https://github.com/bbc/belfrage/blob/cf4278c0a9dcf3adee2c9d5c2599691338b6fb72/config/dev.exs#L4) for `:origin_simulator` to 'http://localhost:8080'
+2. Follow the steps above in 'usage' to run origin-simulator
+3. Run Belfrage locally using `iex -S mix`
+4. Accessing Belfrage locally (http://localhost:7080) will route requests through origin-simulator
+5. It may be helpful to place some debug code ie `IO.inspect()` to [view requests and responses](https://github.com/bbc/origin_simulator/blob/076b8c95e48e042f498227f1da446d53779ab3f2/lib/origin_simulator.ex#L25)
+
+#### Response headers
+OriginSimulator can serve HTTP headers in responses. The headers can be specified in recipes:
+
+```json
+{
+  "route": "/news",
+  "origin": "https://www.bbc.co.uk/news",
+  "stages": [
+    {
+      "at": 0,
+      "latency": "100ms",
+      "status": 200
+    }
+  ],
+  "headers": {
+    "connection": "keepalive",
+    "cache-control": "private, max-age=0, no-cache"
+  }
+}
+```
+
+#### Response compression
+Response compression can be specified via the `content-encoding` header. For example, the following recipe returns a gzip random content of 200kb size.
+
+```json
+{
+  "random_content": "200kb",
+  "stages": [
+      { "at": 0, "status": 200, "latency": 0}
+  ],
+  "headers": {
+    "content-encoding": "gzip"
+  }
+}
+```
+
+A corresponding `content-type` header is required for posted `body` which could be of any type (e.g. JSON, HTML, XML):
+
+```json
+{
+  "route": "/data/json",
+  "body": "{\"data\":\"<<256kb>>\", \"metadata\":\"<<128b>>and<<16b>>\", \"collection\":[\"<<128kb>>\", \"<<256kb>>\"]}\"}",
+  "stages": [
+      { "at": 0, "status": 200, "latency": 0}
+  ],
+  "headers": {
+    "content-encoding": "gzip",
+    "content-type": "application/json; charset=utf-8"
+  }
+}
+```
+
+For recipes with an origin, a gzip response may also be specified with the `"content-encoding": "gzip"` header. OriginSimulator will fetch content from the origin with a `accept-encoding: gzip` header. It will store and serve the gzip content from origin (if provided) during simulation.
+
+```json
+{
+  "route": "/news",
+  "origin": "https://www.bbc.co.uk/news",
+  "stages": [
+      { "at": 0, "status": 200, "latency": 0}
+  ],
+  "headers": {
+    "content-encoding": "gzip"
+  }
+}
+```
+
+#### Using `mix upload_recipe`
+`mix upload_recipe demo` will upload the recipe located at `examples/demo.json` to origin simulator running locally.
+
+If you have deployed origin simulator, you can specify the host when uploading the recipe. For example:
+`mix upload_recipe "http://origin-simulator.com" demo`
+
+#### Admin routes
+
+* /_admin/status
+
+Check if the simulator is running, return `ok!`
+
+* /_admin/add_recipe
+
+Post (POST) recipe: update or create new origins
+
+* /_admin/current_recipe
+
+List existing recipe for all origins and routes
+
+* /_admin/restart
+
+Reset the simulator: remove all recipes
+
+* /_admin/routes
+
+List all origins and routes
+
+* /_admin/routes_status
+
+List all origin and routes with the corresponding current status and latency values
+
+## Performance
+
+OriginSimulator should be performant, it leverages on the concurrency and parallelism model offered by the Erlang BEAM VM and should sustain significant amount of load.
+
+Our goal was to have performance comparable to Nginx serving static files. To demonstate this, we have run a number of load testsusing Nginx/OpenResty as benchmark. We used [WRK2](https://github.com/giltene/wrk2) as load test tool and ran the tests on AWS EC2 instances.
+
+For the tests we used two EC2 instances. The load test client ran on a c5.2xlarge instance. We tried c5.large,c5.xlarge,c5.2xlarge and i3.xlarge instanses for the Simulator and OpenResty targets. Interestingly the results didn't show major performance improvements with bigger instances, full results are [available here](https://gist.github.com/ettomatic/6d2ad680fc331b942a5f535f76eb9d02). In the next sections we'll use the results against i3.xlarge.
+
+The Nginx/OpenResty configuration is very simple and available [here](confs/openresty.conf). While not perfect, we tried to keep it simple, the number of workers has been updated depending of the instance type used.
+
+#### Successful responses with no additional latency
+
+In this scenario we were looking for maximum throughput. Notice how OpenResty excels on smaller files were results were pretty equal for bigger files.
+
+recipe:
+```json
+{
+    "origin": "https://www.bbc.co.uk/news",
+    "stages": [
+        { "at": 0, "status": 200, "latency": "0ms"}
+    ]
+}
+```
+*Throughput with 0ms additional latency*
+
+| payload size | OriginSimulator | OpenResty |
+|--------------|----------------:|----------:|
+| 50kb         |          17,000 |    24,000 |
+| 100kb        |          12,000 |    12,000 |
+| 200kb        |           6,000 |     6,000 |
+| 428kb        |           2,900 |     2,800 |
+|              |                 |           |
+
+![No latency char](/gnuplot/throughput_no_latency.png)
+
+#### Successful responses with 100ms additional latency
+
+In this scenario we had almost identical results with 100 concurrent connections, only after 5,000 connections we started seeing Openresty failing down, this is possibly due to misconfiguration.
+
+recipe:
+```json
+{
+    "origin": "https://www.bbc.co.uk/news",
+    "stages": [
+        { "at": 0, "status": 200, "latency": "100ms"}
+    ]
+}
+```
+
+*payload 428kb 100ms added latency*
+
+| concurrent connections | throughput | OriginSimulator |  OpenResty |
+|-----------------------:|-----------:|-----------------|-----------:|
+|                    100 |        900 | 104.10ms        |   101.46ms |
+|                  1,000 |      1,000 | 214.73ms        |   225.70ms |
+|                  3,000 |      2,000 | 220.50ms        | 244.30ms * |
+|                  5,000 |      1,400 | 161.81ms        | 397.67ms * |
+|                 10,000 |      2,000 | 168.18ms        | 384.92ms * |
+
+> **NOTE:** * OpenResty started increasingly timing out and 500ing after 3K
+concurrent requests.
+
+![100ms latency chart](/gnuplot/response_time_100ms_latency.png)
+
+#### Successful responses with 1s additional latency
+
+With 1s of latency we could see any difference in terms of performance.
+
+recipe
+```json
+{
+    "origin": "https://www.bbc.co.uk/news",
+    "stages": [
+        { "at": 0, "status": 200, "latency": "1s"}
+    ]
+}
+```
+
+*payload 428kb 1s added latency*
+
+| concurrent connections | throughput | OriginSimulator | OpenResty |
+|-----------------------:|-----------:|----------------:|----------:|
+|                    100 |        100 |           1.03s |     1.02s |
+|                    500 |        500 |           1.05s |     1.03s |
+|                    600 |        600 |           1.24s |     1.20s |
+|                  2,000 |      1,000 |           1.10s |  1.11s ** |
+|                  4,000 |      2,000 |         1.09s * |  1.10s ** |
+
+> **NOTE:** * OriginSimulator had a few timeouts at 4K concurrent connections. ** OpenResty started increasingly timing out and 500ing after 2K
+concurrent requests.
+
+![100ms latency chart](/gnuplot/response_time_1s_latency.png)
+
+## Load Tests
+
+For details on Load Test results visit the [Load Tests](docs/load-test-results/) results docs.
+
+## Docker
+
+> **NOTE:** if you plan to use OriginSimulator from Docker for Mac via `docker-compose up` you might notice slow response times.
+> This is down to [Docker for Mac networking integration with the OS](https://github.com/docker/for-mac/issues/2814), which is still the case in 18.09.0.
+>
+> So don't use this setup for load tests, and why would you in any case!
+
+### Docker releases
+
+To generate a release targeted for Centos:
+
+``` shell
+docker build -t origin_simulator .
+docker run --mount=source=/path/to/build,target=/build,type=bind -it origin_simulator
+```
+
+You'll find the package in `./build`
+
+```
+
+# .formatter.exs
+
+```elixir
+# Used by "mix format"
+[
+  inputs: [
+    "{mix,.formatter}.exs",
+    "{config,test}/**/*.{ex,exs}",
+    "lib/**/*.{ex,exs}"
+  ],
+  line_length: 180
+]
+
+```
+
+# test/test_helper.exs
+
+```elixir
+Code.require_file("fixtures/fixtures.exs", __DIR__)
+Code.require_file("fixtures/recipes.exs", __DIR__)
+
+ExUnit.start()
+
+defmodule TestHelpers do
+  use Plug.Test
+  import ExUnit.Assertions
+
+  def admin_domain(), do: OriginSimulator.admin_domain()
+
+  def assert_status_body(conn, status, body) do
+    assert conn.state == :sent
+    assert conn.status == status
+    assert conn.resp_body == body
+    conn
+  end
+
+  def assert_default_page(conn) do
+    assert conn.status == 200
+    assert conn.resp_body |> :zlib.gunzip() =~ "BBC Origin Simulator - Default Content"
+    assert get_resp_header(conn, "content-type") == ["text/html; charset=utf-8"]
+  end
+
+  def assert_resp_header(conn, {header, content}) do
+    assert get_resp_header(conn, header) == content
+    conn
+  end
+end
+
+```
+
+# test/fixtures/fixtures.exs
+
+```elixir
+defmodule Fixtures do
+  @http_client Application.compile_env(:origin_simulator, :http_client)
+
+  def body_mock(headers \\ %{}) do
+    {:ok, %{body: body}} = @http_client.get("/", headers)
+    body
+  end
+
+  def http_error_message(status), do: "Error #{status}"
+
+  def origin_payload() do
+    %{
+      "origin" => "https://www.bbc.co.uk/news",
+      "stages" => [%{"at" => 0, "status" => 200, "latency" => 0}],
+      "route" => "/news"
+    }
+  end
+
+  def origin_payload(context), do: {:ok, Map.put(context, :payload, origin_payload())}
+
+  def body_payload() do
+    %{
+      "body" => "{\"hello\":\"world\"}",
+      "stages" => [%{"at" => 0, "status" => 200, "latency" => 0}],
+      "route" => "/news"
+    }
+  end
+
+  def body_payload(context), do: {:ok, Map.put(context, :payload, body_payload())}
+
+  def random_content_payload() do
+    %{
+      "random_content" => "50kb",
+      "stages" => [%{"at" => 0, "status" => 200, "latency" => 0}]
+    }
+  end
+
+  def multi_route_origin_payload() do
+    [
+      %{
+        "route" => "/sport",
+        "origin" => "https://www.bbc.co.uk/sport",
+        "stages" => [%{"at" => 0, "status" => 200, "latency" => "0ms"}]
+      },
+      %{
+        "route" => "/news",
+        "origin" => "https://www.bbc.co.uk/news",
+        "stages" => [%{"at" => 0, "status" => 200, "latency" => "0ms"}]
+      },
+      %{
+        "route" => "/news/entertainment_and_arts",
+        "origin" => "https://www.bbc.co.uk/news/entertainment_and_arts",
+        "stages" => [%{"at" => 0, "status" => 200, "latency" => "0ms"}]
+      },
+      %{
+        "route" => "/weather",
+        "origin" => "https://www.bbc.co.uk/weather",
+        "stages" => [%{"at" => 0, "status" => 200, "latency" => "0ms"}]
+      }
+    ]
+  end
+
+  def multi_route_mixed_payload() do
+    [
+      %{
+        "route" => "/example/endpoint",
+        "body" => "Example body",
+        "stages" => [
+          %{"at" => 0, "status" => 200, "latency" => "400ms"},
+          %{"at" => "1s", "status" => 503, "latency" => "100ms"}
+        ]
+      },
+      %{
+        "route" => "/news",
+        "origin" => "https://www.bbc.co.uk/news",
+        "stages" => [
+          %{"at" => 0, "status" => 404, "latency" => "50ms"},
+          %{"at" => "2s", "status" => 503, "latency" => "2s"},
+          %{"at" => "4s", "status" => 200, "latency" => "100ms"}
+        ]
+      },
+      %{
+        "route" => "/*",
+        "body" => "Error - not defined",
+        "stages" => [%{"at" => 0, "status" => 406, "latency" => "0ms"}]
+      }
+    ]
+  end
+end
+
+```
+
+# test/fixtures/recipes.exs
+
+```elixir
+defmodule Fixtures.Recipes do
+  alias OriginSimulator.Recipe
+
+  def recipe(overrides \\ []), do: struct(Recipe, Keyword.merge(recipe_defaults(), overrides))
+  defp recipe_defaults(), do: %Recipe{} |> Map.to_list() |> tl
+
+  def origin_recipe(headers \\ %{}) do
+    %Recipe{
+      origin: "https://www.bbc.co.uk/news",
+      stages: [%{"at" => 0, "status" => 200, "latency" => 0}],
+      headers: headers
+    }
+  end
+
+  def origin_recipe_range_latency() do
+    %Recipe{
+      origin: "https://www.bbc.co.uk/news",
+      stages: [%{"at" => 0, "status" => 200, "latency" => "100ms..200ms"}]
+    }
+  end
+
+  def body_recipe(headers \\ %{}) do
+    %Recipe{
+      body: "{\"hello\":\"world\"}",
+      stages: [%{"at" => 0, "status" => 200, "latency" => 0}],
+      headers: headers
+    }
+  end
+
+  def random_content_recipe(size \\ "50kb", headers \\ %{}) do
+    %Recipe{
+      random_content: size,
+      stages: [%{"at" => 0, "status" => 200, "latency" => 0}],
+      headers: headers
+    }
+  end
+
+  def multi_route_origin_recipes() do
+    [default_recipe()] ++
+      [
+        %Recipe{
+          origin: "https://www.bbc.co.uk/news",
+          stages: [%{"at" => 0, "status" => 200, "latency" => 0}],
+          route: "/news"
+        },
+        %Recipe{
+          origin: "https://www.bbc.co.uk/sport",
+          stages: [%{"at" => 0, "status" => 200, "latency" => 0}],
+          route: "/sport"
+        },
+        %Recipe{
+          origin: "https://www.bbc.co.uk/weather",
+          stages: [%{"at" => 0, "status" => 200, "latency" => 0}],
+          route: "/weather"
+        },
+        %Recipe{
+          origin: "https://www.bbc.co.uk/news/entertainment_and_arts",
+          stages: [%{"at" => 0, "status" => 200, "latency" => 0}],
+          route: "news/entertainment_and_arts"
+        }
+      ]
+  end
+
+  def default_recipe do
+    Recipe.default_recipe()
+  end
+end
+
+```
+
+# test/origin_simulator/size_test.exs
+
+```elixir
+defmodule OriginSimulator.SizeTest do
+  use ExUnit.Case
+
+  alias OriginSimulator.Size
+
+  describe "Success" do
+    test "123b" do
+      assert Size.parse("123b") == 123
+    end
+
+    test "123kb" do
+      assert Size.parse("123kb") == 123 * 1024
+    end
+
+    test "123mb" do
+      assert Size.parse("123mb") == 123 * 1024 * 1024
+    end
+  end
+
+  describe "failure" do
+    test "123 as string" do
+      assert_raise RuntimeError, "Invalid size, please define size in b, kb or mb", fn -> Size.parse("123") end
+    end
+
+    test "123 as integer" do
+      assert_raise RuntimeError, "Invalid size, please define size in b, kb or mb", fn -> Size.parse(123) end
+    end
+
+    test "123tb" do
+      assert_raise RuntimeError, "Invalid size, please define size in b, kb or mb", fn -> Size.parse("123tb") end
+    end
+  end
+end
+
+```
+
+# test/origin_simulator/simulation_test.exs
+
+```elixir
+defmodule OriginSimulator.SimulationTest do
+  use ExUnit.Case
+
+  import Fixtures.Recipes
+
+  alias OriginSimulator.{Simulation, Recipe}
+
+  describe "with loaded recipe" do
+    setup do
+      stages = [%{"at" => 0, "status" => 200, "latency" => "1s"}]
+      recipe = recipe(origin: "foo", stages: stages)
+
+      Simulation.add_recipe(:simulation, recipe)
+      Process.sleep(5)
+
+      {:ok, recipe: recipe, route: recipe.route}
+    end
+
+    test "state() returns a tuple with http status and latency in ms for a route", %{route: route} do
+      assert Simulation.state(:simulation, route) == {200, 1000}
+    end
+
+    test "recipe() returns the loaded recipe for a route", %{recipe: recipe, route: route} do
+      assert Simulation.recipe(:simulation, route) == recipe
+    end
+
+    test "route/2 returns matching route", %{recipe: recipe, route: route} do
+      assert Simulation.route(:simulation, route) == recipe |> Map.get(:route)
+    end
+
+    test "route/2 returns matching wildcard route", %{recipe: recipe} do
+      Simulation.add_recipe(:simulation, %{recipe | route: "/news*"})
+      Process.sleep(5)
+
+      assert Simulation.route(:simulation, "/news/uk-politics") == "/news*"
+      assert Simulation.route(:simulation, "/sport") == "/*"
+    end
+
+    test "route/1 returns all routes", %{recipe: recipe} do
+      Simulation.add_recipe(:simulation, %{recipe | route: "/random123123123*"})
+      Process.sleep(5)
+
+      assert length(Simulation.route(:simulation)) > 1
+      assert Simulation.route(:simulation) |> Enum.member?("/random123123123*")
+    end
+  end
+
+  describe "with a list of multiple recipes" do
+    test "add_recipe() works with multiple recipes" do
+      recipe =
+        recipe(
+          origin: "foo",
+          stages: [%{"at" => 0, "status" => 200, "latency" => 0}],
+          route: "/news"
+        )
+
+      assert Simulation.add_recipe(:simulation, [
+               recipe,
+               %{recipe | route: "/sports"},
+               %{recipe | route: "/weather"}
+             ]) == :ok
+    end
+  end
+
+  describe "with a recipe containing a range" do
+    setup do
+      stages = [%{"at" => 0, "status" => 200, "latency" => "1s..1200ms"}]
+      recipe = recipe(origin: "foo", stages: stages)
+
+      Simulation.add_recipe(:simulation, recipe)
+      Process.sleep(5)
+
+      {:ok, recipe: recipe, route: recipe.route}
+    end
+
+    test "state() returns a tuple with http status and latency in ms", %{route: route} do
+      assert Simulation.state(:simulation, route) == {200, 1000..1200}
+    end
+
+    test "recipe() returns the loaded recipe", %{recipe: recipe, route: route} do
+      assert Simulation.recipe(:simulation, route) == recipe
+    end
+  end
+
+  describe "with a recipe containing multiple stages" do
+    setup do
+      stages = [
+        %{"at" => 0, "status" => 200, "latency" => "0s"},
+        %{"at" => "60ms", "status" => 503, "latency" => "1s"}
+      ]
+
+      recipe = recipe(origin: "foo", stages: stages)
+      Simulation.add_recipe(:simulation, recipe)
+      Process.sleep(5)
+
+      {:ok, recipe: recipe, route: recipe.route}
+    end
+
+    test "state() returns a tuple with http status and latency in ms", %{route: route} do
+      assert Simulation.state(:simulation, route) == {200, 0}
+      Process.sleep(80)
+      assert Simulation.state(:simulation, route) == {503, 1000}
+    end
+
+    test "recipe() returns the loaded recipe", %{recipe: recipe, route: route} do
+      assert Simulation.recipe(:simulation, route) == recipe
+    end
+  end
+
+  describe "with only the default recipe loaded" do
+    setup do
+      Simulation.restart()
+      Process.sleep(5)
+    end
+
+    test "state() returns a tuple with default values" do
+      assert Simulation.state(:simulation, Recipe.default_route()) == {200, 100}
+    end
+
+    test "recipe() returns an empty list" do
+      assert Simulation.recipe(:simulation) == [default_recipe()]
+    end
+
+    test "route() returns default route" do
+      assert Simulation.route(:simulation, "/random_path") == "/*"
+    end
+  end
+end
+
+```
+
+# test/origin_simulator/payload_test.exs
+
+```elixir
+defmodule OriginSimulator.PayloadTest do
+  use ExUnit.Case, async: true
+  import Fixtures.Recipes
+  import OriginSimulator, only: [recipe_not_set: 0]
+
+  alias OriginSimulator.Payload
+
+  # TODO: additional tests for fetching and storing multi-origin / source content in ETS
+  describe "with origin" do
+    setup do
+      Payload.fetch(:payload, origin_recipe())
+    end
+
+    test "Always return an error body for 5xx" do
+      assert Payload.body(:payload, 500) == {:ok, "Error 500"}
+    end
+
+    test "Always return 'Not Found' for 404s" do
+      assert Payload.body(:payload, 404) == {:ok, "Not found"}
+    end
+
+    test "Suggests to add a recipe for 406" do
+      assert Payload.body(:payload, 406) == {:ok, recipe_not_set()}
+    end
+
+    test "returns the origin body for 200" do
+      assert Payload.body(:payload, 200) == {:ok, "some content from origin"}
+    end
+  end
+
+  describe "with content" do
+    setup do
+      Payload.fetch(:payload, body_recipe())
+    end
+
+    test "Always return an error body for 5xx" do
+      assert Payload.body(:payload, 500) == {:ok, "Error 500"}
+    end
+
+    test "Always return 'Not Found' for 404s" do
+      assert Payload.body(:payload, 404) == {:ok, "Not found"}
+    end
+
+    test "Suggests to add a recipe for 406" do
+      assert Payload.body(:payload, 406) == {:ok, recipe_not_set()}
+    end
+
+    test "returns the origin body for 200" do
+      assert Payload.body(:payload, 200) == {:ok, "{\"hello\":\"world\"}"}
+    end
+  end
+
+  describe "without content for not modified" do
+    test "returns an empty body" do
+      assert Payload.body(:payload, 304) == {:ok, ""}
+    end
+  end
+
+  describe "recipe with gzip content-encoding header" do
+    test "returns gzip body from origin" do
+      Payload.fetch(:payload, origin_recipe(%{"content-encoding" => "gzip"}))
+      assert Payload.body(:payload, 200) == {:ok, :zlib.gzip("some content from origin")}
+    end
+
+    test "returns gzip body (posted)" do
+      Payload.fetch(:payload, body_recipe(%{"content-encoding" => "gzip"}))
+      assert Payload.body(:payload, 200) == {:ok, :zlib.gzip("{\"hello\":\"world\"}")}
+    end
+
+    test "returns gzip random content" do
+      Payload.fetch(:payload, random_content_recipe("10kb", %{"content-encoding" => "gzip"}))
+      {:ok, gzip_content} = Payload.body(:payload, 200)
+
+      assert gzip_content |> :zlib.gunzip() |> String.length() == 10 * 1024
+    end
+  end
+end
+
+```
+
+# test/origin_simulator/origin_simulator_test.exs
+
+```elixir
+defmodule OriginSimulatorTest do
+  use ExUnit.Case
+  use Plug.Test
+
+  import Fixtures
+  import Fixtures.Recipes
+  import TestHelpers
+
+  doctest OriginSimulator
+
+  setup do
+    OriginSimulator.Simulation.restart()
+    Process.sleep(10)
+  end
+
+  describe "GET / when a recipe is set" do
+    test "will return the origin page" do
+      payload = origin_recipe() |> Poison.encode!()
+      conn(:post, "/#{admin_domain()}/add_recipe", payload) |> OriginSimulator.call([])
+      Process.sleep(20)
+
+      conn(:get, "/")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, body_mock())
+      |> assert_resp_header({"content-type", ["text/html; charset=utf-8"]})
+    end
+
+    test "will return gzip origin page with appropriate headers" do
+      headers = %{
+        "cache-control" => "public, max-age=30",
+        "connection" => "keepalive",
+        "content-encoding" => "gzip"
+      }
+
+      payload = origin_recipe(headers) |> Poison.encode!()
+      conn(:post, "/#{admin_domain()}/add_recipe", payload) |> OriginSimulator.call([])
+      Process.sleep(20)
+
+      conn(:get, "/")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, body_mock() |> :zlib.gzip())
+      |> assert_resp_header({"cache-control", ["public, max-age=30"]})
+      |> assert_resp_header({"content-type", ["text/html; charset=utf-8"]})
+      |> assert_resp_header({"content-encoding", ["gzip"]})
+      |> assert_resp_header({"connection", ["keepalive"]})
+    end
+
+    test "will return the origin page with random latency within range" do
+      payload = origin_recipe_range_latency() |> Poison.encode!()
+      conn(:post, "/#{admin_domain()}/add_recipe", payload) |> OriginSimulator.call([])
+      Process.sleep(20)
+
+      conn(:get, "/")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, body_mock())
+      |> assert_resp_header({"content-type", ["text/html; charset=utf-8"]})
+    end
+
+    test "will return the parsed body content" do
+      payload = body_recipe() |> Poison.encode!()
+      conn(:post, "/#{admin_domain()}/add_recipe", payload) |> OriginSimulator.call([])
+      Process.sleep(20)
+
+      conn(:get, "/")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, body_mock(%{"content-type" => "application/json"}))
+      |> assert_resp_header({"content-type", ["application/json; charset=utf-8"]})
+    end
+
+    test "will return the parsed body content with respond headers" do
+      headers = %{"response-header" => "123"}
+      payload = body_recipe(headers) |> Poison.encode!()
+
+      conn(:post, "/#{admin_domain()}/add_recipe", payload) |> OriginSimulator.call([])
+      Process.sleep(20)
+
+      conn(:get, "/")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, body_mock(%{"content-type" => "application/json"}))
+      |> assert_resp_header({"content-type", ["application/json; charset=utf-8"]})
+      |> assert_resp_header({"response-header", [headers["response-header"]]})
+    end
+
+    test "will return gzip parsed body with appropriate headers" do
+      headers = %{
+        "cache-control" => "public, max-age=30",
+        "connection" => "keepalive",
+        "content-encoding" => "gzip",
+        "content-type" => "application/json; charset=utf-8"
+      }
+
+      payload = body_recipe(headers) |> Poison.encode!()
+
+      conn(:post, "/#{admin_domain()}/add_recipe", payload) |> OriginSimulator.call([])
+      Process.sleep(20)
+
+      conn(:get, "/")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, body_mock(%{"content-type" => "application/json"}) |> :zlib.gzip())
+      |> assert_resp_header({"cache-control", ["public, max-age=30"]})
+      |> assert_resp_header({"content-type", ["application/json; charset=utf-8"]})
+      |> assert_resp_header({"content-encoding", ["gzip"]})
+      |> assert_resp_header({"connection", ["keepalive"]})
+    end
+
+    test "will return random content of the parsed size" do
+      payload = random_content_recipe("50kb") |> Poison.encode!()
+      conn(:post, "/#{admin_domain()}/add_recipe", payload) |> OriginSimulator.call([])
+      Process.sleep(20)
+
+      conn = conn(:get, "/")
+      conn = OriginSimulator.call(conn, [])
+
+      assert conn.state == :sent
+      assert conn.status == 200
+      assert get_resp_header(conn, "content-type") == ["text/html; charset=utf-8"]
+      assert String.length(conn.resp_body) == 50 * 1024
+    end
+
+    test "will return gzip random content with appropriate headers" do
+      headers = %{
+        "cache-control" => "public, max-age=30",
+        "connection" => "keepalive",
+        "content-encoding" => "gzip",
+        "content-type" => "text/html; charset=utf-8"
+      }
+
+      payload = random_content_recipe("50kb", headers) |> Poison.encode!()
+      conn(:post, "/#{admin_domain()}/add_recipe", payload) |> OriginSimulator.call([])
+      Process.sleep(20)
+
+      conn = conn(:get, "/")
+      conn = OriginSimulator.call(conn, [])
+
+      assert conn.state == :sent
+      assert conn.status == 200
+      assert get_resp_header(conn, "content-type") == ["text/html; charset=utf-8"]
+      assert String.length(conn.resp_body |> :zlib.gunzip()) == 50 * 1024
+    end
+
+    test "will increment response counter" do
+      payload = origin_recipe() |> Poison.encode!()
+      conn(:post, "/#{admin_domain()}/add_recipe", payload) |> OriginSimulator.call([])
+      Process.sleep(20)
+
+      current_count = OriginSimulator.Counter.value().total_requests
+      conn(:get, "/") |> OriginSimulator.call([])
+
+      assert OriginSimulator.Counter.value().total_requests == current_count + 1
+    end
+
+    test "will return an empty body with 304 status" do
+      recipe =
+        recipe(
+          body: "",
+          stages: [%{"at" => 0, "status" => 304, "latency" => 0}]
+        )
+
+      payload = recipe |> Poison.encode!()
+
+      conn(:post, "/#{admin_domain()}/add_recipe", payload) |> OriginSimulator.call([])
+      Process.sleep(20)
+
+      conn(:get, "/")
+      |> OriginSimulator.call([])
+      |> assert_status_body(304, "")
+      |> assert_resp_header({"content-type", ["text/html; charset=utf-8"]})
+    end
+  end
+
+  describe "POST / when a recipe is set" do
+    test "will return the origin page" do
+      payload = origin_recipe() |> Poison.encode!()
+      conn(:post, "/#{admin_domain()}/add_recipe", payload) |> OriginSimulator.call([])
+      Process.sleep(20)
+
+      conn(:post, "/", "")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, body_mock())
+      |> assert_resp_header({"content-type", ["text/html; charset=utf-8"]})
+    end
+
+    test "will return the parsed body content" do
+      payload = body_recipe() |> Poison.encode!()
+      conn(:post, "/#{admin_domain()}/add_recipe", payload) |> OriginSimulator.call([])
+      Process.sleep(20)
+
+      conn(:post, "/", "")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, body_mock(%{"content-type" => "application/json"}))
+      |> assert_resp_header({"content-type", ["application/json; charset=utf-8"]})
+    end
+  end
+
+  describe "when a recipe is not set" do
+    test "GET / will return the default content" do
+      conn(:get, "/")
+      |> OriginSimulator.call([])
+      |> assert_default_page()
+    end
+
+    test "POST / will return an error message" do
+      conn(:post, "/")
+      |> OriginSimulator.call([])
+      |> assert_default_page()
+    end
+  end
+
+  describe "when a recipe with route and origin is set" do
+    setup :origin_payload
+
+    test "GET routed page will return the origin page", %{payload: payload} do
+      conn(:post, "/#{admin_domain()}/add_recipe", Poison.encode!(payload))
+      |> OriginSimulator.call([])
+
+      Process.sleep(20)
+
+      conn(:get, payload["route"])
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, body_mock())
+    end
+
+    test "GET routed (wildcard) page will return the origin page", %{payload: payload} do
+      payload = Map.put(payload, "route", "/news*")
+
+      conn(:post, "/#{admin_domain()}/add_recipe", Poison.encode!(payload))
+      |> OriginSimulator.call([])
+
+      Process.sleep(20)
+
+      conn(:get, "/news/uk-politics-51287430")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, body_mock())
+    end
+
+    test "POST \"\" to routed page will return the origin page", %{payload: payload} do
+      conn(:post, "/#{admin_domain()}/add_recipe", Poison.encode!(payload))
+      |> OriginSimulator.call([])
+
+      Process.sleep(20)
+
+      conn(:post, payload["route"], "")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, body_mock())
+    end
+
+    test "POST \"\" to routed (wildcard) page will return the origin page", %{payload: payload} do
+      payload = Map.put(payload, "route", "/news*")
+
+      conn(:post, "/#{admin_domain()}/add_recipe", Poison.encode!(payload))
+      |> OriginSimulator.call([])
+
+      Process.sleep(20)
+
+      conn(:post, "/news/uk-politics-51287430", "")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, body_mock())
+    end
+
+    test "GET /* will return the origin page", %{payload: payload} do
+      payload = Map.put(payload, "route", "/*")
+
+      conn(:post, "/#{admin_domain()}/add_recipe", Poison.encode!(payload))
+      |> OriginSimulator.call([])
+
+      Process.sleep(20)
+
+      conn(:get, "/any_path")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, body_mock())
+    end
+
+    test "GET non-matching route will return the default page", %{payload: payload} do
+      conn(:post, "/#{admin_domain()}/add_recipe", Poison.encode!(payload))
+      |> OriginSimulator.call([])
+
+      Process.sleep(20)
+
+      conn(:get, "/not_matching_random_path")
+      |> OriginSimulator.call([])
+      |> assert_default_page()
+    end
+
+    test "GET non-matching route (widlcard) will return the default page", %{payload: payload} do
+      payload = Map.put(payload, "route", "/news*")
+
+      conn(:post, "/#{admin_domain()}/add_recipe", Poison.encode!(payload))
+      |> OriginSimulator.call([])
+
+      Process.sleep(20)
+
+      conn(:get, "/cbbc")
+      |> OriginSimulator.call([])
+      |> assert_default_page()
+    end
+  end
+
+  describe "when a recipe with route and body is set" do
+    setup :body_payload
+
+    test "GET routed page will return the body", %{payload: payload} do
+      conn(:post, "/#{admin_domain()}/add_recipe", Poison.encode!(payload))
+      |> OriginSimulator.call([])
+
+      Process.sleep(20)
+
+      conn(:get, payload["route"])
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, body_mock(%{"content-type" => "application/json"}))
+    end
+
+    test "GET routed (wildcard) page will return the body", %{payload: payload} do
+      payload = Map.put(payload, "route", "/news*")
+
+      conn(:post, "/#{admin_domain()}/add_recipe", Poison.encode!(payload))
+      |> OriginSimulator.call([])
+
+      Process.sleep(20)
+
+      conn(:get, "/news/uk-politics-51287430")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, body_mock(%{"content-type" => "application/json"}))
+    end
+
+    test "POST \"\" to routed page will return the body", %{payload: payload} do
+      conn(:post, "/#{admin_domain()}/add_recipe", Poison.encode!(payload))
+      |> OriginSimulator.call([])
+
+      Process.sleep(20)
+
+      conn(:post, payload["route"])
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, body_mock(%{"content-type" => "application/json"}))
+    end
+
+    test "POST \"\" to routed (wildcard) page will return the body", %{payload: payload} do
+      payload = Map.put(payload, "route", "/news*")
+
+      conn(:post, "/#{admin_domain()}/add_recipe", Poison.encode!(payload))
+      |> OriginSimulator.call([])
+
+      Process.sleep(20)
+
+      conn(:post, "/news/uk-politics-51287430")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, body_mock(%{"content-type" => "application/json"}))
+    end
+
+    test "GET /* will return the body", %{payload: payload} do
+      payload = Map.put(payload, "route", "/*")
+
+      conn(:post, "/#{admin_domain()}/add_recipe", Poison.encode!(payload))
+      |> OriginSimulator.call([])
+
+      Process.sleep(20)
+
+      conn(:get, "/news/uk-politics-51287430")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, body_mock(%{"content-type" => "application/json"}))
+
+      conn(:get, "/sport/tennis/51291122")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, body_mock(%{"content-type" => "application/json"}))
+    end
+
+    test "GET non-matching route will return the default page", %{payload: payload} do
+      conn(:post, "/#{admin_domain()}/add_recipe", Poison.encode!(payload))
+      |> OriginSimulator.call([])
+
+      Process.sleep(20)
+
+      conn(:get, "/random_path")
+      |> OriginSimulator.call([])
+      |> assert_default_page()
+    end
+
+    test "GET non-matching route (widlcard) will return the default page", %{payload: payload} do
+      payload = Map.put(payload, "route", "/news*")
+
+      conn(:post, "/#{admin_domain()}/add_recipe", Poison.encode!(payload))
+      |> OriginSimulator.call([])
+
+      Process.sleep(20)
+
+      conn(:get, "/sport")
+      |> OriginSimulator.call([])
+      |> assert_default_page()
+    end
+  end
+
+  describe "when a recipe with multiple routes and origins is set" do
+    test "GET /* route will return the origin page" do
+      payload = [
+        %{
+          "route" => "/*",
+          "origin" => "https://www.bbc.co.uk/news",
+          "stages" => [%{"at" => 0, "status" => 200, "latency" => 0}]
+        }
+      ]
+
+      conn(:post, "/#{admin_domain()}/add_recipe", Poison.encode!(payload))
+      |> OriginSimulator.call([])
+
+      Process.sleep(20)
+
+      conn(:get, "/any_path")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, body_mock())
+    end
+
+    test "GET multiple routes will return the origin page" do
+      payload = multi_route_origin_payload()
+
+      conn(:post, "/#{admin_domain()}/add_recipe", Poison.encode!(payload))
+      |> OriginSimulator.call([])
+
+      Process.sleep(20)
+
+      for route <- payload |> Enum.map(& &1["route"]) do
+        conn(:get, route)
+        |> OriginSimulator.call([])
+        |> assert_status_body(200, body_mock())
+      end
+    end
+  end
+end
+
+```
+
+# test/origin_simulator/recipe_test.exs
+
+```elixir
+defmodule OriginSimulator.RecipeTest do
+  use ExUnit.Case, async: true
+
+  alias OriginSimulator.Recipe
+
+  test "Parse valid JSON" do
+    json = ~s[{"random_content": "123kb"}]
+    assert Recipe.parse({:ok, json, nil}) == %Recipe{random_content: "123kb"}
+  end
+
+  test "Given some headers it adds them to the recipe" do
+    json = ~s[{"headers": {"host": "www.example.com"}}]
+    assert Recipe.parse({:ok, json, nil}) == %Recipe{headers: %{"host" => "www.example.com"}}
+  end
+
+  test "default_route/0 returns correct value" do
+    recipe = %Recipe{}
+    assert Recipe.default_route() == recipe.route
+  end
+end
+
+```
+
+# test/origin_simulator/admin_router_test.exs
+
+```elixir
+defmodule OriginSimulator.AdminRouterTest do
+  use ExUnit.Case
+  use Plug.Test
+
+  import Fixtures.Recipes
+  import TestHelpers
+
+  setup do
+    OriginSimulator.Simulation.restart()
+    Process.sleep(10)
+  end
+
+  describe "GET /#{admin_domain()}/status" do
+    test "will return 'OK'" do
+      conn(:get, "/#{admin_domain()}/status")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, "ok!")
+      |> assert_resp_header({"content-type", ["text/plain; charset=utf-8"]})
+    end
+
+    test "will not match request with similar path and get the default page" do
+      conn(:get, "/another_domain/status")
+      |> OriginSimulator.call([])
+      |> assert_default_page()
+    end
+  end
+
+  describe "GET /#{admin_domain()}/routes" do
+    test "will return default route" do
+      conn(:get, "/#{admin_domain()}/routes")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, "/*")
+      |> assert_resp_header({"content-type", ["text/plain; charset=utf-8"]})
+    end
+
+    test "will return the default content" do
+      conn(:get, "/another_domain/routes")
+      |> OriginSimulator.call([])
+      |> assert_default_page()
+    end
+
+    test "will not increment response counter" do
+      current_count = OriginSimulator.Counter.value().total_requests
+      conn(:get, "/#{admin_domain()}/routes") |> OriginSimulator.call([])
+
+      assert OriginSimulator.Counter.value().total_requests == current_count
+    end
+  end
+
+  describe "GET /#{admin_domain()}/routes_status" do
+    test "will return default route" do
+      conn(:get, "/#{admin_domain()}/routes_status")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, "/* 200 100")
+      |> assert_resp_header({"content-type", ["text/plain; charset=utf-8"]})
+    end
+
+    test "will return the default page" do
+      conn(:get, "/another_domain/routes_status")
+      |> OriginSimulator.call([])
+      |> assert_default_page()
+    end
+  end
+
+  describe "GET /#{admin_domain()}/restart" do
+    test "will return default route" do
+      conn(:get, "/_admin/restart")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, "ok!")
+      |> assert_resp_header({"content-type", ["text/plain; charset=utf-8"]})
+    end
+
+    test "will return the default content" do
+      conn(:get, "/another_domain/restart")
+      |> OriginSimulator.call([])
+      |> assert_default_page()
+    end
+  end
+
+  describe "GET /#{admin_domain()}/current_recipe" do
+    test "will return the default recipe" do
+      conn(:get, "/#{admin_domain()}/current_recipe")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, [default_recipe()] |> Poison.encode!())
+      |> assert_resp_header({"content-type", ["application/json; charset=utf-8"]})
+    end
+
+    test "will return the default content" do
+      conn(:get, "/another_domain/current_recipe")
+      |> OriginSimulator.call([])
+      |> assert_default_page()
+    end
+
+    test "will return the payload if set" do
+      payload = [origin_recipe()] |> Poison.encode!()
+      conn(:post, "/#{admin_domain()}/add_recipe", payload) |> OriginSimulator.call([])
+
+      conn(:get, "/#{admin_domain()}/current_recipe")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, payload)
+      |> assert_resp_header({"content-type", ["application/json; charset=utf-8"]})
+    end
+
+    test "will return the payload if set for ranged latencies" do
+      payload = [origin_recipe_range_latency()] |> Poison.encode!()
+      conn(:post, "/#{admin_domain()}/add_recipe", payload) |> OriginSimulator.call([])
+
+      conn(:get, "/#{admin_domain()}/current_recipe")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, payload)
+      |> assert_resp_header({"content-type", ["application/json; charset=utf-8"]})
+    end
+
+    test "will return the headers in the payload when provided" do
+      payload = [origin_recipe()] |> Poison.encode!()
+      conn(:post, "/#{admin_domain()}/add_recipe", payload) |> OriginSimulator.call([])
+
+      conn(:get, "/#{admin_domain()}/current_recipe")
+      |> OriginSimulator.call([])
+      |> assert_status_body(200, payload)
+      |> assert_resp_header({"content-type", ["application/json; charset=utf-8"]})
+    end
+
+    test "will return multi-recipe payload if set" do
+      payload = multi_route_origin_recipes() |> Poison.encode!()
+
+      conn(:post, "/#{admin_domain()}/add_recipe", payload)
+      |> OriginSimulator.call([])
+      |> assert_status_body(201, payload)
+      |> assert_resp_header({"content-type", ["application/json; charset=utf-8"]})
+    end
+  end
+
+  describe "POST /#{admin_domain()}/add_recipe" do
+    test "will handle recipe upload" do
+      payload = [origin_recipe()] |> Poison.encode!()
+
+      conn(:post, "/#{admin_domain()}/add_recipe", payload)
+      |> OriginSimulator.call([])
+      |> assert_status_body(201, payload)
+      |> assert_resp_header({"content-type", ["application/json; charset=utf-8"]})
+    end
+
+    # TODO: need fixing, see comment near `post "/:admin/add_recipe"`
+    # in `lib/origin_simulator.ex` ~line 42
+    test "will mhandle malformed recipe", do: true
+
+    test "will return the default content" do
+      conn(:get, "/another_domain/add_recipe")
+      |> OriginSimulator.call([])
+      |> assert_default_page()
+    end
+  end
+end
+
+```
+
+# test/origin_simulator/body_test.exs
+
+```elixir
+defmodule OriginSimulator.RandomiserTest do
+  use ExUnit.Case
+
+  alias OriginSimulator.Body
+
+  describe "parsing a string containg a placeholder" do
+    test "keeps text outside of placeholders " do
+      decoded_body = Body.parse("{\"data\":\"<<1kb>>\"}") |> Poison.decode!()
+      assert String.length(decoded_body["data"]) == 1024
+    end
+
+    test "keeps text (gzip) outside of placeholders " do
+      headers = %{"content-encoding" => "gzip"}
+
+      decoded_body =
+        Body.parse("{\"data\":\"<<1kb>>\"}", headers)
+        |> :zlib.gunzip()
+        |> Poison.decode!()
+
+      assert String.length(decoded_body["data"]) == 1024
+    end
+
+    test "replaces placeholders with random content" do
+      parsed_string = Body.parse("{\"data\":\"some random<<4kb>>and also<<10kb>>this\"}")
+      refute parsed_string =~ ~r"<<.+?>>"
+    end
+  end
+
+  describe "parsing a string containg multiple placeholders" do
+    test "keeps text outside of placeholders " do
+      parsed_string = Body.parse("{\"data\":\"some random<<4kb>>and also<<10kb>>this\"}")
+      assert parsed_string =~ "some random"
+    end
+
+    test "keeps text (gzip) outside of placeholders " do
+      headers = %{"content-encoding" => "gzip"}
+
+      parsed_string =
+        Body.parse("{\"data\":\"some random<<4kb>>and also<<10kb>>this\"}", headers)
+        |> :zlib.gunzip()
+
+      assert parsed_string =~ "some random"
+    end
+
+    test "replaces placeholders with random content" do
+      parsed_string = Body.parse("{\"data\":\"some random<<4kb>>and also<<10kb>>this\"}")
+      refute parsed_string =~ ~r"<<.+?>>"
+    end
+
+    test "produces a random string of the expected size" do
+      decoded_body = Body.parse("{\"data\":\"some random<<4kb>>and also<<10kb>>this\"}") |> Poison.decode!()
+
+      assert String.length(decoded_body["data"]) == 14_359
+    end
+  end
+
+  describe "parsing a string with no placeholders" do
+    test "returns the same string content " do
+      string = "abcdefghi"
+      assert Body.parse(string) == string
+    end
+
+    test "returns gzip string" do
+      string = "abcdefghi"
+      headers = %{"content-encoding" => "gzip"}
+      assert Body.parse(string, headers) == :zlib.gzip(string)
+    end
+  end
+
+  describe "generating random content" do
+    test "returns content of expected size" do
+      assert Body.randomise("300kb") |> String.length() == 300 * 1024
+    end
+
+    test "returns gzip content of expected size" do
+      headers = %{"content-encoding" => "gzip"}
+      assert Body.randomise("300kb", headers) |> :zlib.gunzip() |> String.length() == 300 * 1024
+    end
+  end
+end
+
+```
+
+# test/origin_simulator/duration_test.exs
+
+```elixir
+defmodule OriginSimulator.DurationTest do
+  use ExUnit.Case
+
+  alias OriginSimulator.Duration
+
+  describe "parsing a integer" do
+    test "0" do
+      assert Duration.parse(0) == 0
+    end
+
+    test "1" do
+      assert_raise RuntimeError, "Invalid timing, please define time in s or ms", fn -> Duration.parse(1) end
+    end
+  end
+
+  describe "parsing a binary string" do
+    test "0" do
+      assert Duration.parse("0") == 0
+    end
+
+    test "0ms" do
+      assert Duration.parse("0ms") == 0
+    end
+
+    test "0s" do
+      assert Duration.parse("0s") == 0
+    end
+
+    test "100ms" do
+      assert Duration.parse("100ms") == 100
+    end
+
+    test "1s" do
+      assert Duration.parse("1s") == 1000
+    end
+
+    test "range 100ms..200ms" do
+      assert Duration.parse("100ms..200ms") == 100..200
+    end
+
+    test "range 1s..2s" do
+      assert Duration.parse("1s..2s") == 1000..2000
+    end
+
+    test "range 800ms..1s" do
+      assert Duration.parse("800ms..1s") == 800..1000
+    end
+
+    test "invalid range" do
+      assert_raise RuntimeError, "Invalid timing, please define time in s or ms", fn -> Duration.parse("1..2s") end
+    end
+  end
+
+  describe "parsing a tuple" do
+    test 0 do
+      assert Duration.parse({0, ""}) == 0
+    end
+
+    test "0ms" do
+      assert Duration.parse({0, "ms"}) == 0
+    end
+
+    test "0s" do
+      assert Duration.parse({0, "s"}) == 0
+    end
+
+    test "100ms" do
+      assert Duration.parse({100, "ms"}) == 100
+    end
+
+    test "1s" do
+      assert Duration.parse({1, "s"}) == 1000
+    end
+  end
+
+  describe "parsing an array of tuples" do
+    test "range 100ms..200ms" do
+      assert Duration.parse([{100, "ms"}, {200, "ms"}]) == 100..200
+    end
+
+    test "range 1s..2s" do
+      assert Duration.parse([{1, "s"}, {2, "s"}]) == 1000..2000
+    end
+
+    test "range 800ms..1s" do
+      assert Duration.parse([{800, "ms"}, {1, "s"}]) == 800..1000
+    end
+  end
+end
+
+```
+
+# config/dev.exs
+
+```elixir
+import Config
+
+```
+
+# config/config.exs
+
+```elixir
+import Config
+
+# This configuration is loaded before any dependency and is restricted
+# to this project. If another project depends on this project, this
+# file won't be loaded nor affect the parent project. For this reason,
+# if you want to provide default values for your application for
+# 3rd-party users, it should be done in your "mix.exs" file.
+
+# You can configure your application as:
+#
+#     config :origin_simulator, key: :value
+#
+# and access this configuration in your application as:
+#
+#     Application.get_env(:origin_simulator, :key)
+#
+# You can also configure a 3rd-party app:
+#
+#     config :logger, level: :info
+#
+config :origin_simulator,
+  admin_domain: "_admin",
+  http_client: OriginSimulator.HTTP.Client,
+  http_port: 8080
+
+import_config "#{Mix.env()}.exs"
+
+```
+
+# config/prod.exs
+
+```elixir
+import Config
+
+```
+
+# config/test.exs
+
+```elixir
+import Config
+
+config :origin_simulator, http_port: 8081
+config :origin_simulator, http_client: OriginSimulator.HTTP.MockClient
+
+```
+
+# docs/load-test-results/2019-01-15.md
+
+```markdown
+# Load tests
+- 15th January 2019
+- Instance: t3.medium
+
+## Findings
+These load tests have revealed a performance bottleneck caused by 
+storing a large response in the Payload genserver. You can see from 
+the load tests bellow that when serving a large payload such as the 
+news homepage, the latency takes a big hit, and affects the number 
+of RPS the app can handle. This is compared to a much smaller payload 
+of roughly 100 characters where it can handle 2000rps with a latency 
+of 1.88ms.
+
+## Next steps
+Try using an ETS cache in the Payload genserver that shares access to
+other processes.
+
+### t3.medium
+
+#### Large payload from origin (news front page):
+1k rps
+```
+wrk -t2 -c10 -d30s -R1000 http://ec2-18-130-181-134.eu-west-2.compute.amazonaws.com:8084/
+Running 30s test @ http://ec2-18-130-181-134.eu-west-2.compute.amazonaws.com:8084/
+  2 threads and 10 connections
+
+  Thread calibration: mean lat.: 4.248ms, rate sampling interval: 10ms
+  Thread calibration: mean lat.: 3.166ms, rate sampling interval: 10ms
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     3.32ms    2.74ms  57.79ms   95.38%
+    Req/Sec   526.55     97.43     1.11k    79.05%
+  29994 requests in 30.00s, 11.97GB read
+Requests/sec:    999.73
+Transfer/sec:    408.67MB
+```
+
+2k rps
+```
+wrk -t2 -c10 -d30s -R2000 http://ec2-18-130-181-134.eu-west-2.compute.amazonaws.com:8084/
+Running 30s test @ http://ec2-18-130-181-134.eu-west-2.compute.amazonaws.com:8084/
+  2 threads and 10 connections
+
+  Thread calibration: mean lat.: 1033.683ms, rate sampling interval: 4607ms
+  Thread calibration: mean lat.: 1421.625ms, rate sampling interval: 6221ms
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     4.32s     3.72s   12.09s    58.54%
+    Req/Sec   762.86    145.93     0.93k    42.86%
+  44540 requests in 30.00s, 17.78GB read
+Requests/sec:   1484.59
+Transfer/sec:    606.94MB
+```
+
+#### A much smaller payload (about 100 characters):
+1k rps
+```
+wrk -t2 -c10 -d30s -R1000 http://ec2-18-130-181-134.eu-west-2.compute.amazonaws.com:8084/
+Running 30s test @ http://ec2-18-130-181-134.eu-west-2.compute.amazonaws.com:8084/
+  2 threads and 10 connections
+  Thread calibration: mean lat.: 1.702ms, rate sampling interval: 10ms
+  Thread calibration: mean lat.: 1.683ms, rate sampling interval: 10ms
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     1.69ms  615.50us  10.89ms   88.06%
+    Req/Sec   526.94     69.41     1.11k    77.96%
+  29994 requests in 30.00s, 6.44MB read
+Requests/sec:    999.76
+Transfer/sec:    219.67KB
+```
+
+2k rps
+```
+wrk -t2 -c10 -d30s -R2000 http://ec2-18-130-181-134.eu-west-2.compute.amazonaws.com:8084/
+Running 30s test @ http://ec2-18-130-181-134.eu-west-2.compute.amazonaws.com:8084/
+  2 threads and 10 connections
+  Thread calibration: mean lat.: 1.639ms, rate sampling interval: 10ms
+  Thread calibration: mean lat.: 2.099ms, rate sampling interval: 10ms
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     1.88ms    6.05ms 211.20ms   99.68%
+    Req/Sec     1.06k   152.59     2.11k    66.52%
+  59982 requests in 30.00s, 12.87MB read
+Requests/sec:   1999.17
+Transfer/sec:    439.27KB
+```
+
+10k rps
+```
+wrk -t2 -c10 -d30s -R10000 http://ec2-18-130-181-134.eu-west-2.compute.amazonaws.com:8084/
+Running 30s test @ http://ec2-18-130-181-134.eu-west-2.compute.amazonaws.com:8084/
+  2 threads and 10 connections
+  Thread calibration: mean lat.: 627.280ms, rate sampling interval: 2308ms
+  Thread calibration: mean lat.: 625.284ms, rate sampling interval: 2297ms
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.41s   648.08ms   3.92s    62.53%
+    Req/Sec     4.45k   204.88     4.56k    87.50%
+  262966 requests in 30.00s, 56.43MB read
+Requests/sec:   8765.51
+Transfer/sec:      1.88MB
+```
+
+#### Status endpoint for comparison
+10k rps
+```
+wrk -t2 -c10 -d30s -R10000 http://ec2-18-130-181-134.eu-west-2.compute.amazonaws.com:8084/status
+Running 30s test @ http://ec2-18-130-181-134.eu-west-2.compute.amazonaws.com:8084/status
+  2 threads and 10 connections
+  Thread calibration: mean lat.: 1.735ms, rate sampling interval: 10ms
+  Thread calibration: mean lat.: 1.817ms, rate sampling interval: 10ms
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     6.25ms   25.23ms 227.84ms   96.05%
+    Req/Sec     5.28k   366.11     6.33k    62.87%
+  299870 requests in 30.00s, 53.48MB read
+Requests/sec:   9995.63
+Transfer/sec:      1.78MB
+```
+
+### c5.large
+
+#### Large payload from origin (news front page):
+1k rps:
+```
+wrk -t2 -c10 -d30s -R1000 http://ec2-18-130-64-24.eu-west-2.compute.amazonaws.com:8084/
+Running 30s test @ http://ec2-18-130-64-24.eu-west-2.compute.amazonaws.com:8084/
+  2 threads and 10 connections
+  Thread calibration: mean lat.: 2.181ms, rate sampling interval: 10ms
+  Thread calibration: mean lat.: 2.262ms, rate sampling interval: 10ms
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.34ms    4.23ms 204.16ms   99.85%
+    Req/Sec   526.35     75.86     1.22k    73.60%
+  29994 requests in 30.00s, 12.28GB read
+Requests/sec:    999.70
+Transfer/sec:    419.14MB
+```
+
+2k rps:
+```
+wrk -t2 -c10 -d30s -R2000 http://ec2-18-130-64-24.eu-west-2.compute.amazonaws.com:8084/
+Running 30s test @ http://ec2-18-130-64-24.eu-west-2.compute.amazonaws.com:8084/
+  2 threads and 10 connections
+  Thread calibration: mean lat.: 2.831ms, rate sampling interval: 10ms
+  Thread calibration: mean lat.: 2.491ms, rate sampling interval: 10ms
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.66ms  687.19us   6.98ms   63.91%
+    Req/Sec     1.05k   121.55     1.55k    75.57%
+  59982 requests in 30.00s, 24.56GB read
+Requests/sec:   1999.26
+Transfer/sec:    838.19MB
+```
+
+10k rps:
+```
+wrk -t2 -c10 -d30s -R10000 http://ec2-18-130-64-24.eu-west-2.compute.amazonaws.com:8084/
+Running 30s test @ http://ec2-18-130-64-24.eu-west-2.compute.amazonaws.com:8084/
+  2 threads and 10 connections
+  Thread calibration: mean lat.: 3167.347ms, rate sampling interval: 11771ms
+  Thread calibration: mean lat.: 3790.086ms, rate sampling interval: 13656ms
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    13.64s     4.56s   22.99s    61.36%
+    Req/Sec     1.43k   235.00     1.66k   100.00%
+  85599 requests in 30.00s, 35.05GB read
+Requests/sec:   2853.33
+Transfer/sec:      1.17GB
+```
+
+#### A much smaller payload (about 100 characters):
+1k rps
+```
+wrk -t2 -c10 -d30s -R1000 http://ec2-18-130-64-24.eu-west-2.compute.amazonaws.com:8084/
+Running 30s test @ http://ec2-18-130-64-24.eu-west-2.compute.amazonaws.com:8084/
+  2 threads and 10 connections
+  Thread calibration: mean lat.: 1.448ms, rate sampling interval: 10ms
+  Thread calibration: mean lat.: 1.507ms, rate sampling interval: 10ms
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     1.48ms  382.43us   5.44ms   72.05%
+    Req/Sec   534.43     68.18     0.89k    80.51%
+  29996 requests in 30.00s, 6.44MB read
+Requests/sec:    999.81
+Transfer/sec:    219.69KB
+```
+
+2k rps
+```
+wrk -t2 -c10 -d30s -R2000 http://ec2-18-130-64-24.eu-west-2.compute.amazonaws.com:8084/
+Running 30s test @ http://ec2-18-130-64-24.eu-west-2.compute.amazonaws.com:8084/
+  2 threads and 10 connections
+
+  Thread calibration: mean lat.: 1.536ms, rate sampling interval: 10ms
+  Thread calibration: mean lat.: 2.519ms, rate sampling interval: 10ms
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     1.53ms  367.83us   5.55ms   65.05%
+    Req/Sec     1.05k   102.42     1.50k    77.42%
+  59983 requests in 30.00s, 12.87MB read
+Requests/sec:   1999.33
+Transfer/sec:    439.31KB
+```
+
+10k rps
+```
+wrk -t2 -c10 -d30s -R10000 http://ec2-18-130-64-24.eu-west-2.compute.amazonaws.com:8084/
+Running 30s test @ http://ec2-18-130-64-24.eu-west-2.compute.amazonaws.com:8084/
+  2 threads and 10 connections
+  Thread calibration: mean lat.: 6.945ms, rate sampling interval: 54ms
+  Thread calibration: mean lat.: 5.645ms, rate sampling interval: 21ms
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     6.72ms   24.98ms 222.85ms   97.20%
+    Req/Sec     5.10k   188.87     5.80k    73.11%
+  299640 requests in 30.00s, 64.30MB read
+Requests/sec:   9988.06
+Transfer/sec:      2.14MB
+```
+
+```
+
+# docs/load-test-results/2020-02-10.md
+
+```markdown
+# Load Test Results
+
+## Context
+
+There has been significant changes to the internals of origin_simulator to enable [multi-route origin simulation](https://github.com/bbc/origin_simulator/tree/multi-route-origin-simulation). The simulation state data structure is now a Map containing routes and the corresponding simulation state, instead of a tuple of global latency and status values. There is also an inherest cost in looking up state data per route.
+
+## Hypothesis
+
+- The performance of [multi-route origin simulation](https://github.com/bbc/origin_simulator/tree/multi-route-origin-simulation) is comparable with single-origin simulation, i.e. the [current master branch](https://github.com/bbc/origin_simulator/tree/04a9fd3bc5a6c3259c816024e72a398096768f70).
+
+## Setup
+- Vegeta Runner on EC2
+- OriginSimulator deployed on EC2: Type: 1 x c5.2xlarge instance, CPUs: 8 vCPUs (4 core, 2 threads per core)
+
+## Tests
+Run the following tests on test origins (see below)
+
+1. 60s, 200rps, 0ms simulated latency
+2. 60s, 200rps, 100ms simulated latency
+3. 180s 500rps, 100ms simulated latency on master, multi1
+4. Concurrent 60s, 200rps, 100ms simulated latency test on 3 routes / 3 origins
+
+## Test Origins
+Single-origin: OriginSimulator running the current master branch
+
+- `master`, origin: http://www.bbc.co.uk/news, route: "/"
+
+Multiple-route: OriginSimulator running the [multi-route-origin-simulation](https://github.com/bbc/origin_simulator/tree/multi-route-origin-simulation) branch
+
+- `multi1`, origin: http://www.bbc.co.uk/news, route: "/news" 
+- `multi2`, origin: http://www.bbc.co.uk/sport, route: "/sport"
+- `multi3`: origin: http://www.bbc.co.uk/sounds, route: "/sounds"
+
+## Results
+
+The performance of multi-route origin simulation is similar to that of the current master branch (non-route simulation).
+
+### 1. 60s, 200rps, 0ms latency
+
+#### `master`
+
+```
+ID: 1581088819782
+Requests      [total, rate, throughput]  12000, 200.02, 200.01
+Duration      [total, attack, wait]      59.998s, 59.995s, 2.709ms
+Latencies     [mean, 50, 95, 99, max]    2.798ms, 2.721ms, 3.279ms, 3.587ms, 34.64ms
+Bytes In      [total, mean]              5561136000, 463428.00
+```
+
+[Results](https://broxy.tools.bbc.co.uk/belfrage-loadtest-results/vegeta-60s-200rps-1581088819782)
+
+#### `multi1`
+
+```
+ID: 1581081597677
+Requests      [total, rate, throughput]  12000, 200.02, 200.01
+Duration      [total, attack, wait]      59.997s, 59.995s, 2.062ms
+Latencies     [mean, 50, 95, 99, max]    2.086ms, 2.047ms, 2.348ms, 2.632ms, 26.88ms
+Bytes In      [total, mean]              5557464000, 463122.00
+```
+
+[Results](https://broxy.tools.bbc.co.uk/belfrage-loadtest-results/vegeta-60s-200rps-1581081597677)
+
+`multi2`, `multi3` tests yield similar results:
+
+- [multi2](https://broxy.tools.bbc.co.uk/belfrage-loadtest-results/vegeta-60s-200rps-1581081709492)
+- [multi3](https://broxy.tools.bbc.co.uk/belfrage-loadtest-results/vegeta-60s-200rps-1581081884398)
+
+### 2. 60s, 200rps, 100ms latency
+
+#### `master`
+
+```
+ID: 1581089005365
+Requests      [total, rate, throughput]  12000, 200.02, 199.67
+Duration      [total, attack, wait]      1m0.098s, 59.995s, 103.493ms
+Latencies     [mean, 50, 95, 99, max]    103.916ms, 103.660ms, 105.238ms, 107.031ms, 134.064ms
+Bytes In      [total, mean]              5560356000, 463363.00
+```
+
+[Results](https://broxy.tools.bbc.co.uk/belfrage-loadtest-results/vegeta-60s-200rps-1581089005365)
+
+#### `multi1`
+
+```
+ID: 1581080186366
+Requests      [total, rate, throughput]  12000, 200.02, 199.67
+Duration      [total, attack, wait]      1m0.0988s, 59.995s, 103.013ms
+Latencies     [mean, 50, 95, 99, max]    103.043ms, 102.969ms, 103.521ms, 105.138ms, 306.457ms
+Bytes In      [total, mean]              5543760000, 461980.00
+```
+
+[Results](https://broxy.tools.bbc.co.uk/belfrage-loadtest-results/vegeta-60s-200rps-1581080186366)
+
+`multi2`, `multi3` tests yield similar results:
+
+- [multi2](https://broxy.tools.bbc.co.uk/belfrage-loadtest-results/vegeta-60s-200rps-1581080415847)
+- [multi3](https://broxy.tools.bbc.co.uk/belfrage-loadtest-results/vegeta-60s-200rps-1581080592000)
+
+### 3. 180s 500rps, 100ms latency
+
+#### `master`
+
+```
+ID: 1581326372837
+Requests      [total, rate, throughput]  30808, 500.02, 499.19
+Duration      [total, attack, wait]      1m1.716s, 1m1.614s, 102.388ms
+Latencies     [mean, 50, 95, 99, max]    104.292ms, 103.818ms, 106.314ms, 112.997ms, 326.687ms
+Bytes In      [total, mean]              14305355912, 464339.00
+```
+
+[Results](https://broxy.tools.bbc.co.uk/belfrage-loadtest-results/vegeta-180s-500rps-1581326372837)
+
+#### `multi1`
+
+```
+ID: 1581324622973
+Requests      [total, rate, throughput]  29330, 500.02, 499.13
+Duration      [total, attack, wait]      58.7622s, 58.658s, 104.293ms
+Latencies     [mean, 50, 95, 99, max]    104.206ms, 104.033ms, 105.416ms, 107.754ms, 182.962ms
+Bytes In      [total, mean]              13618094980, 464306.00
+```
+
+[Results](https://broxy.tools.bbc.co.uk/belfrage-loadtest-results/vegeta-180s-500rps-1581324622973)
+
+### 4.  Concurrent 60s, 200rps, 100ms simulated latency
+#### `multi1`
+
+```
+ID: 1581081010811
+Requests      [total, rate, throughput]  12000, 200.02, 199.67
+Duration      [total, attack, wait]      1m0.098s, 59.995s, 103.265ms
+Latencies     [mean, 50, 95, 99, max]    103.032ms, 102.922ms, 103.823ms, 105.381ms, 307.446ms
+Bytes In      [total, mean]              5543760000, 461980.00
+```
+
+[Results](https://broxy.tools.bbc.co.uk/belfrage-loadtest-results/vegeta-60s-200rps-1581081010811)
+
+#### `multi2`
+
+```
+ID: 1581081019037
+Requests      [total, rate, throughput]  12000, 200.02, 199.67
+Duration      [total, attack, wait]      1m0.098s, 59.995s, 102.662ms
+Latencies     [mean, 50, 95, 99, max]    103.207ms, 103.122ms, 104.052ms, 105.064ms, 112.502ms
+Bytes In      [total, mean]              5664840000, 472070.00
+```
+
+[Results](https://broxy.tools.bbc.co.uk/belfrage-loadtest-results/vegeta-60s-200rps-1581081019037)
+
+#### `multi3`
+
+```
+ID: 1581081031608
+Requests      [total, rate, throughput]  12000, 200.02, 199.67
+Duration      [total, attack, wait]      1m0.0977s, 59.995s, 102.676ms
+Latencies     [mean, 50, 95, 99, max]    103.336ms, 103.240ms, 104.245ms, 105.593ms, 111.997ms
+Bytes In      [total, mean]              4683084000, 390257.00
+```
+
+[Results](https://broxy.tools.bbc.co.uk/belfrage-loadtest-results/vegeta-60s-200rps-1581081031608)
+
+## Comparison
+
+
+![](images/vegeta_60s_200rps_100220.png)
+60s 200rps, 100ms latency, `master` vs. `multi2`
+
+![](images/vegeta_180s_500rps_100220.png)
+180s 500rps, 100ms latency, `master` vs. `multi1`
+
+## Notes:
+
+Most results exhibit a similar trend in which the slower requests happened at the beginning of test.
+This might be a characteristic of BEAM/ETS when a single route/page is requested repeatedly.
+
+OriginSimulator does not utilises much CPU, with occasional ~50% (single core) spikes observed.
+
+
+```
+
+# rel/config.exs
+
+```elixir
+# Import all plugins from `rel/plugins`
+# They can then be used by adding `plugin MyPlugin` to
+# either an environment, or release definition, where
+# `MyPlugin` is the name of the plugin module.
+~w(rel plugins *.exs)
+|> Path.join()
+|> Path.wildcard()
+|> Enum.map(&Code.eval_file(&1))
+
+use Distillery.Releases.Config,
+    # This sets the default release built by `mix distillery.release`
+    default_release: :default,
+    # This sets the default environment used by `mix distillery.release`
+    default_environment: Mix.env()
+
+# For a full list of config options for both releases
+# and environments, visit https://hexdocs.pm/distillery/config/distillery.html
+
+
+# You may define one or more environments in this file,
+# an environment's settings will override those of a release
+# when building in that environment, this combination of release
+# and environment configuration is called a profile
+
+environment :dev do
+  # If you are running Phoenix, you should make sure that
+  # server: true is set and the code reloader is disabled,
+  # even in dev mode.
+  # It is recommended that you build with MIX_ENV=prod and pass
+  # the --env flag to Distillery explicitly if you want to use
+  # dev mode.
+  set dev_mode: true
+  set include_erts: false
+  set cookie: :")u]u5uIDftJ:JXT)q>F@*Lgbj.JvCv%x,E6wqZT2d=mlwHcn^6UaMus1$xLvj3AY"
+end
+
+environment :prod do
+  set include_erts: true
+  set include_src: false
+  set cookie: :"F[)4.;<E@l,(~!C;:M@_dN@MtJ(^)3NI<O02aY0I$MBX_@a_lg>of8T[3Mn5%~_g"
+  set vm_args: "rel/vm.args"
+end
+
+# You may define one or more releases in this file.
+# If you have not set a default release, or selected one
+# when running `mix release`, the first release in the file
+# will be used by default
+
+release :origin_simulator do
+  set version: current_version(:origin_simulator)
+  set applications: [
+    :runtime_tools
+  ]
+end
+
+
+```
+
+# lib/origin_simulator.ex
+
+```elixir
+defmodule OriginSimulator do
+  use Plug.Router
+  alias OriginSimulator.{Payload, Simulation, Plug.ResponseCounter}
+
+  plug(ResponseCounter)
+  plug(:match)
+  plug(:dispatch)
+
+  forward("/_admin", to: OriginSimulator.AdminRouter)
+
+  get "/*glob" do
+    serve_payload(conn, Simulation.route(:simulation, conn.request_path))
+  end
+
+  post "/*glob" do
+    serve_payload(conn, Simulation.route(:simulation, conn.request_path))
+  end
+
+  match _ do
+    send_resp(conn, 404, "not found")
+  end
+
+  def admin_domain(), do: Application.get_env(:origin_simulator, :admin_domain)
+
+  defp serve_payload(conn, route) do
+    {status, latency} = Simulation.state(:simulation, route)
+
+    sleep(latency)
+
+    {:ok, body} = Payload.body(:payload, status, conn.request_path, route)
+
+    recipe = Simulation.recipe(:simulation, route)
+
+    conn
+    |> put_resp_content_type(content_type(body))
+    |> merge_resp_headers(recipe_headers(recipe))
+    |> send_resp(status, body)
+  end
+
+  defp recipe_headers(nil), do: []
+  defp recipe_headers(recipe), do: recipe.headers
+
+  defp content_type(body) do
+    if String.first(body) == "{" do
+      "application/json"
+    else
+      "text/html"
+    end
+  end
+
+  defp sleep(0), do: nil
+  defp sleep(%Range{} = time), do: :timer.sleep(Enum.random(time))
+  defp sleep(duration), do: :timer.sleep(duration)
+
+  def recipe_not_set(),
+    do: "Recipe not set, please POST a recipe to /#{admin_domain()}/add_recipe"
+
+  def recipe_not_set(path) do
+    "Recipe not set at #{path}, please POST a recipe for this route to /#{admin_domain()}/add_recipe"
+  end
+end
+
+```
+
+# lib/mix/upload_recipe.ex
+
+```elixir
+defmodule Mix.Tasks.UploadRecipe do
+  use Mix.Task
+
+  def run([host, recipe]) do
+    {:ok, _started} = Application.ensure_all_started(:httpoison)
+
+    recipe = get_json("./examples/#{recipe}.json")
+
+    HTTPoison.post("#{host}/_admin/add_recipe", recipe)
+  end
+
+  def run([recipe]) do
+    run(["http://localhost:8080", recipe])
+  end
+
+  defp get_json(filename) do
+    File.read!(filename)
+  end
+end
+
+```
+
+# lib/origin_simulator/default_recipe.ex
+
+```elixir
+defmodule OriginSimulator.DefaultRecipe do
+  alias OriginSimulator.Recipe
+
+  def recipe do
+    %Recipe{
+      headers: %{
+        "cache-control" => "public, max-age=30",
+        "content-encoding" => "gzip"
+      },
+      stages: [
+        %{
+          "at" => 0,
+          "status" => 200,
+          "latency" => "100ms"
+        }
+      ],
+      body: default_html_body()
+    }
+  end
+
+  defp default_html_body do
+    ~s"""
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <link rel="stylesheet" href="https://unpkg.com/@picocss/pico@1.*/css/pico.classless.min.css">
+        <title>BBC Origin Simulator - Default Content</title>
+      </head>
+      <body>
+        <main>
+          <header>
+            <hgroup>
+              <h1>BBC Origin Simulator</h1>
+              <h2>A tool to simulate a (flaky) upstream origin during load and stress tests.</h2>
+            </hgroup>
+          </header>
+          <hr/>
+          <h5>Welcome!</h5>
+          <p>This is the default content, just to get you started. <mark>You should create and add your own recipe!</mark></p>
+          <p>Here's a basic example, once loaded, it fetches the BBC News front page, stores it in a cache and serves it continuosly with a simulated latency of 100 milliseconds.</p>
+            <pre>
+              <code>
+                {
+                  "origin": "https://www.bbc.co.uk/news",
+                  "headers": {
+                     "cache-control": "public, max-age=30",
+                     "content-encoding": "gzip"
+                  },
+                  "stages": [{"at": 0, "status": 200, "latency": "100ms"}]
+                }</code>
+            </pre>
+          <p>You can read more about Origin Simulator <a href="https://github.com/bbc/origin_simulator">here</a>, but to quickly start adding a recipe run:
+            <pre><code>curl -X POST -d @my_recipe.json http://my.origin-simulator.xyz/_admin/add_recipe</code></pre>
+          </p>
+          <p>
+            To see the current recipe use:
+            <pre><code>curl http://my.origin-simulator.xyz/_admin/current_recipe</code></pre>
+          </p>
+          <p>Happy testing!</p>
+        </main>
+      </body>
+    </html>
+    """
+  end
+end
+
+```
+
+# lib/origin_simulator/supervisor.ex
+
+```elixir
+defmodule OriginSimulator.Supervisor do
+  use Supervisor
+
+  def start_link(init_arg) do
+    Supervisor.start_link(__MODULE__, init_arg, name: __MODULE__)
+  end
+
+  @impl true
+  def init(_init_arg) do
+    children = [
+      OriginSimulator.Payload,
+      OriginSimulator.Counter,
+      OriginSimulator.Simulation
+    ]
+
+    opts = [
+      strategy: :one_for_all,
+      max_restarts: 30
+    ]
+
+    Supervisor.init(children, opts)
+  end
+end
+
+```
+
+# lib/origin_simulator/duration.ex
+
+```elixir
+defmodule OriginSimulator.Duration do
+  def parse(0), do: 0
+
+  def parse(time) when is_integer(time) do
+    raise("Invalid timing, please define time in s or ms")
+  end
+
+  def parse(time) when is_binary(time) do
+    cond do
+      String.contains?(time, "..") -> String.split(time, "..")
+      true -> Integer.parse(time)
+    end
+    |> parse()
+  end
+
+  def parse({time, "ms"}), do: time
+
+  def parse({time, "s"}), do: time * 1000
+
+  def parse({0, _}), do: 0
+
+  def parse({_, _}) do
+    raise("Invalid timing, please define time in s or ms")
+  end
+
+  def parse([min, max]) do
+    Range.new(parse(min), parse(max))
+  end
+end
+
+```
+
+# lib/origin_simulator/size.ex
+
+```elixir
+defmodule OriginSimulator.Size do
+  def parse(size) when is_binary(size) do
+    Integer.parse(size) |> parse()
+  end
+
+  def parse({size, "b"}), do: size
+
+  def parse({size, "kb"}) do
+    size * 1024
+  end
+
+  def parse({size, "mb"}) do
+    size * 1024 * 1024
+  end
+
+  def parse(_) do
+    raise("Invalid size, please define size in b, kb or mb")
+  end
+end
+
+```
+
+# lib/origin_simulator/simulation.ex
+
+```elixir
+defmodule OriginSimulator.Simulation do
+  use GenServer
+
+  alias OriginSimulator.{Duration, Payload, Recipe}
+
+  ## Client API
+
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts, name: :simulation)
+  end
+
+  def state(server) do
+    GenServer.call(server, :state)
+  end
+
+  def state(server, route) do
+    GenServer.call(server, {:state, route})
+  end
+
+  def recipe(server) do
+    GenServer.call(server, :recipe)
+  end
+
+  def recipe(server, route) do
+    GenServer.call(server, {:recipe, route})
+  end
+
+  def route(server, route) do
+    GenServer.call(server, {:route, route})
+  end
+
+  def route(server) do
+    GenServer.call(server, :route)
+  end
+
+  def add_recipe(server, recipes) when is_list(recipes) do
+    resp =
+      for recipe <- recipes do
+        GenServer.call(server, {:add_recipe, recipe})
+      end
+
+    if Enum.all?(resp, &(&1 == :ok)), do: :ok, else: :error
+  end
+
+  def add_recipe(server, new_recipe) do
+    GenServer.call(server, {:add_recipe, new_recipe})
+  end
+
+  def restart do
+    GenServer.stop(:simulation)
+  end
+
+  ## Server Callbacks
+
+  @impl true
+  def init(_) do
+    {:ok, %{}, {:continue, :setup_default_recipe}}
+  end
+
+  @impl true
+  def handle_call(:state, _from, state) do
+    {:reply, state, state}
+  end
+
+  @impl true
+  def handle_call({:state, route}, _from, state) do
+    {:reply, {state[route].status, state[route].latency}, state}
+  end
+
+  @impl true
+  def handle_call({:recipe, route}, _from, state) do
+    {:reply, state[route].recipe, state}
+  end
+
+  # retrieve all recipes
+  @impl true
+  def handle_call(:recipe, _from, state) do
+    {
+      :reply,
+      Map.values(state)
+      |> Enum.filter(&(&1.recipe != nil))
+      |> Enum.map(& &1.recipe),
+      state
+    }
+  end
+
+  @impl true
+  def handle_call({:add_recipe, new_recipe}, _caller, state) do
+    simulation = ingest_recipe(state, new_recipe)
+
+    {:reply, :ok, simulation}
+  end
+
+  @impl true
+  def handle_call({:route, route}, _from, state) do
+    {:reply, match_route(state, state[route], route), state}
+  end
+
+  @impl true
+  def handle_call(:route, _from, state), do: {:reply, state |> Map.keys(), state}
+
+  @impl true
+  def handle_info({:update, route, status, latency}, state) do
+    {:noreply, Map.put(state, route, %{state[route] | status: status, latency: latency})}
+  end
+
+  @impl true
+  def handle_continue(:setup_default_recipe, state) do
+    default_recipe = Recipe.default_recipe()
+    simulation = ingest_recipe(state, default_recipe)
+
+    {:noreply, simulation}
+  end
+
+  defp ingest_recipe(state, new_recipe) do
+    :ok = Payload.fetch(:payload, new_recipe)
+
+    route = new_recipe.route
+    simulation = get(state[route])
+
+    Enum.map(new_recipe.stages, fn item ->
+      Process.send_after(
+        self(),
+        {:update, route, item["status"], Duration.parse(item["latency"])},
+        Duration.parse(item["at"])
+      )
+    end)
+
+    Map.put(state, route, %{simulation | recipe: new_recipe})
+  end
+
+  defp get(nil), do: default_simulation()
+  defp get(current_state), do: current_state
+
+  defp default_simulation, do: %{recipe: nil, status: 406, latency: 0}
+
+  defp match_route(state, nil, route) do
+    Map.keys(state)
+    |> Enum.filter(&String.ends_with?(&1, "*"))
+    |> match_wildcard_route(route)
+  end
+
+  defp match_route(_state, simulation, _route), do: simulation.recipe.route
+
+  # find the nearest wildcard, e.g.
+  # "/news/politics" matches "/news*" first, cf. "/*"
+  # "/sport" matches "/*" not "/news*"
+  defp match_wildcard_route(routes, route) do
+    routes
+    |> Enum.reverse()
+    |> Enum.find(&matching_wildcard_route?(&1, route))
+  end
+
+  defp matching_wildcard_route?(r1, r2) do
+    String.starts_with?(r2, String.trim(r1, "*"))
+  end
+end
+
+```
+
+# lib/origin_simulator/admin_router.ex
+
+```elixir
+defmodule OriginSimulator.AdminRouter do
+  use Plug.Router
+
+  alias OriginSimulator.{Recipe, Simulation, Counter}
+
+  plug(:match)
+  plug(:dispatch)
+
+  get "/status" do
+    conn
+    |> put_resp_content_type("text/plain")
+    |> send_resp(200, "ok!")
+  end
+
+  get "/current_recipe" do
+    recipes = Simulation.recipe(:simulation)
+    msg = if recipes == [], do: OriginSimulator.recipe_not_set(), else: recipes
+
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(200, Poison.encode!(msg))
+  end
+
+  get "/clear_current_count" do
+    Counter.clear()
+
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(200, ~s({"cleared": "yes"}))
+  end
+
+  # TODO: consider ways to bifurcate counts per route, using
+  # OTP state to store count rather than a Plug 
+  get "/current_count" do
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(200, Poison.encode!(Counter.value()))
+  end
+
+  post "/add_recipe" do
+    # TODO: tofix, origin_simulator currently not handling malformed recipe
+    # as `Recipe.parse` hard-wired to output from
+    # Plug read i.e. {:ok, binary, any} with `Poison.decode!`
+    # that throws uncaught `Poison.ParseError` exception 
+    recipe = Recipe.parse(Plug.Conn.read_body(conn))
+    response = Simulation.add_recipe(:simulation, recipe)
+
+    # TODO: Simulation.recipe no longer return :error
+    {status, body, content_type} =
+      case response do
+        :ok -> {201, Poison.encode!(Simulation.recipe(:simulation)), "application/json"}
+        :error -> {406, "Not Acceptable", "text/html"}
+      end
+
+    conn
+    |> put_resp_content_type(content_type)
+    |> send_resp(status, body)
+  end
+
+  get "/restart" do
+    Simulation.restart()
+    Process.sleep(10)
+
+    conn
+    |> put_resp_content_type("text/plain")
+    |> send_resp(200, "ok!")
+  end
+
+  get "/routes" do
+    conn
+    |> put_resp_content_type("text/plain")
+    |> send_resp(200, Simulation.route(:simulation) |> Enum.join("\n"))
+  end
+
+  get "/routes_status" do
+    body =
+      for {route, simulation} <- Simulation.state(:simulation) do
+        "#{route} #{simulation.status} #{simulation.latency}"
+      end
+      |> Enum.join("\n")
+
+    conn
+    |> put_resp_content_type("text/plain")
+    |> send_resp(200, body)
+  end
+end
+
+```
+
+# lib/origin_simulator/body.ex
+
+```elixir
+defmodule OriginSimulator.Body do
+  @regex ~r"<<(.+?)>>"
+
+  alias OriginSimulator.Size
+
+  def parse(str, headers \\ %{})
+
+  def parse(str, %{"content-encoding" => "gzip"}) do
+    Regex.replace(@regex, str, fn _whole, tag -> randomise(tag) end)
+    |> :zlib.gzip()
+  end
+
+  def parse(str, _) do
+    Regex.replace(@regex, str, fn _whole, tag -> randomise(tag) end)
+  end
+
+  def randomise(tag, headers \\ %{})
+  def randomise(tag, %{"content-encoding" => "gzip"}), do: randomise(tag, %{}) |> :zlib.gzip()
+
+  def randomise(tag, _) do
+    size_in_bytes = Size.parse(tag)
+
+    :crypto.strong_rand_bytes(size_in_bytes)
+    |> Base.encode64()
+    |> binary_part(0, size_in_bytes)
+  end
+end
+
+```
+
+# lib/origin_simulator/recipe.ex
+
+```elixir
+defmodule OriginSimulator.Recipe do
+  alias OriginSimulator.DefaultRecipe
+
+  defstruct origin: nil, body: nil, random_content: nil, headers: %{}, stages: [], route: "/*"
+
+  @type t :: %__MODULE__{
+          origin: String.t(),
+          body: String.t(),
+          random_content: String.t(),
+          headers: map(),
+          route: String.t()
+        }
+
+  # TODO: parameters don't make sense, need fixing
+  @spec parse({:ok, binary(), any()}) :: binary()
+  def parse({:ok, "[" <> body, _conn}), do: Poison.decode!("[" <> body, as: [%__MODULE__{}])
+  def parse({:ok, body, _conn}), do: String.replace(body, "\n", "") |> Poison.decode!(as: %__MODULE__{})
+  def parse(body), do: String.replace(body, "\n", "") |> Poison.decode!(as: %__MODULE__{})
+
+  @spec default_route() :: binary()
+  def default_route(), do: %__MODULE__{}.route
+
+  def default_recipe, do: DefaultRecipe.recipe()
+end
+
+```
+
+# lib/origin_simulator/counter.ex
+
+```elixir
+defmodule OriginSimulator.Counter do
+  use Agent
+
+  @initial_state %{total_requests: 0}
+
+  def start_link(_opts) do
+    Agent.start_link(fn -> @initial_state end, name: __MODULE__)
+  end
+
+  def value do
+    Agent.get(__MODULE__, & &1)
+  end
+
+  def clear do
+    Agent.update(__MODULE__, fn _state ->
+      @initial_state
+    end)
+  end
+
+  def increment("/_admin/" <> _path, _status_code), do: :ok
+  def increment(_path, status_code), do: increment(status_code)
+
+  def increment(status_code) do
+    Agent.update(__MODULE__, fn state ->
+      state
+      |> increment_key(:total_requests)
+      |> increment_key(status_code)
+    end)
+  end
+
+  defp increment_key(state, key) do
+    {_, state} =
+      Map.get_and_update(state, key, fn
+        nil -> {nil, 1}
+        current_value -> {current_value, current_value + 1}
+      end)
+
+    state
+  end
+end
+
+```
+
+# lib/origin_simulator/payload.ex
+
+```elixir
+defmodule OriginSimulator.Payload do
+  use GenServer
+
+  alias OriginSimulator.{Body, Recipe}
+
+  @http_client Application.get_env(:origin_simulator, :http_client)
+
+  ## Client API
+
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts, name: :payload)
+  end
+
+  def fetch(server, %Recipe{origin: value, route: route} = recipe) when is_binary(value) do
+    GenServer.call(server, {:fetch, recipe, route})
+  end
+
+  def fetch(server, %Recipe{body: value, route: route} = recipe) when is_binary(value) do
+    GenServer.call(server, {:parse, recipe, route})
+  end
+
+  def fetch(server, %Recipe{random_content: value, route: route} = recipe)
+      when is_binary(value) do
+    GenServer.call(server, {:generate, recipe, route})
+  end
+
+  def body(_server, status, path \\ Recipe.default_route(), route \\ Recipe.default_route()) do
+    case {status, path} do
+      {200, _} -> cache_lookup(route)
+      {304, _} -> {:ok, ""}
+      {404, _} -> {:ok, "Not found"}
+      {406, "/*"} -> {:ok, OriginSimulator.recipe_not_set()}
+      {406, _} -> {:ok, OriginSimulator.recipe_not_set(path)}
+      _ -> {:ok, "Error #{status}"}
+    end
+  end
+
+  defp cache_lookup(route) do
+    case :ets.lookup(:payload, route) do
+      [{^route, body}] -> {:ok, body}
+      [] -> {:error, "content not found"}
+    end
+  end
+
+  ## Server Callbacks
+
+  @impl true
+  def init(_) do
+    :ets.new(:payload, [:set, :protected, :named_table, read_concurrency: true])
+    {:ok, nil}
+  end
+
+  @impl true
+  def handle_call({:fetch, recipe, route}, _from, state) do
+    {:ok, %HTTPoison.Response{body: body}} = @http_client.get(recipe.origin, recipe.headers)
+    :ets.insert(:payload, {route, body})
+    {:reply, :ok, state}
+  end
+
+  @impl true
+  def handle_call({:parse, recipe, route}, _from, state) do
+    :ets.insert(:payload, {route, Body.parse(recipe.body, recipe.headers)})
+
+    {:reply, :ok, state}
+  end
+
+  @impl true
+  def handle_call({:generate, recipe, route}, _from, state) do
+    :ets.insert(:payload, {route, Body.randomise(recipe.random_content, recipe.headers)})
+
+    {:reply, :ok, state}
+  end
+end
+
+```
+
+# lib/origin_simulator/application.ex
+
+```elixir
+defmodule OriginSimulator.Application do
+  @moduledoc false
+
+  use Application
+
+  def start(_type, _args) do
+    children = [
+      Plug.Adapters.Cowboy.child_spec(
+        scheme: :http,
+        plug: OriginSimulator,
+        options: [
+          port: Application.fetch_env!(:origin_simulator, :http_port),
+          protocol_options: [max_keepalive: 5_000_000, max_header_value_length: 16_384, idle_timeout: 10_000]
+        ]
+      ),
+      OriginSimulator.Supervisor
+    ]
+
+    opts = [
+      strategy: :one_for_one,
+      name: OriginSimulator.AppSupervisor,
+      max_restarts: 30
+    ]
+
+    Supervisor.start_link(children, opts)
+  end
+end
+
+```
+
+# lib/origin_simulator/http/client.ex
+
+```elixir
+defmodule OriginSimulator.HTTP.Client do
+  def get(endpoint, headers \\ %{})
+
+  def get(endpoint, %{"content-encoding" => "gzip"} = headers) do
+    new_headers =
+      headers
+      |> Map.delete("content-encoding")
+      |> Map.put("accept-encoding", "gzip")
+
+    get(endpoint, new_headers)
+  end
+
+  def get(endpoint, headers) do
+    options = [recv_timeout: 3000]
+    HTTPoison.get(endpoint, headers |> Map.to_list(), options)
+  end
+end
+
+```
+
+# lib/origin_simulator/http/mock_client.ex
+
+```elixir
+defmodule OriginSimulator.HTTP.MockClient do
+  def get(_endpoint, headers \\ %{})
+  def get(_endpoint, %{"content-type" => "application/json"}), do: {:ok, %HTTPoison.Response{body: "{\"hello\":\"world\"}"}}
+  def get(_endpoint, %{"content-encoding" => "gzip"}), do: {:ok, %HTTPoison.Response{body: :zlib.gzip("some content from origin")}}
+  def get(_endpoint, _headers), do: {:ok, %HTTPoison.Response{body: "some content from origin"}}
+end
+
+```
+
+# lib/origin_simulator/plug/response_counter.ex
+
+```elixir
+defmodule OriginSimulator.Plug.ResponseCounter do
+  @behaviour Plug
+  import Plug.Conn, only: [register_before_send: 2]
+
+  def init(opts), do: opts
+
+  def call(conn, _opts) do
+    register_before_send(conn, fn conn ->
+      OriginSimulator.Counter.increment(conn.request_path, conn.status)
+      conn
+    end)
+  end
+end
+
+```
+
